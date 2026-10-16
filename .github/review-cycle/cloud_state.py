@@ -27,6 +27,13 @@ STATES = {"ready", "processing", "waiting_review", "awaiting_verification", "ver
 PROTECTED_PARTS = {".git", ".github", ".claude", ".codex"}
 PROTECTED_FILES = {"agents.md", "claude.md", ".mcp.json"}
 MAX_HUMAN_REQUEST_HISTORY = 10
+MAX_BASELINE_HISTORY = 10
+BASELINE_EVIDENCE_FIELDS = {
+    "document_revision", "document_fingerprint", "document_paths", "review_manifest",
+    "review_criteria", "review_required_ci", "review_task", "review_requests",
+    "native_final_verdict", "verified_codex_review", "consensus_proof",
+    "reservation", "verification_reservation",
+}
 
 RESULT_SCHEMA = {
     "type": "object", "additionalProperties": False,
@@ -308,6 +315,23 @@ def new_ledger() -> dict:
     return {"schema_version": 1, "pulls": {}}
 
 
+def validate_baseline_approval(value):
+    if (not isinstance(value, dict) or value.get("schema_version") != 1
+            or not isinstance(value.get("request_id"), str)
+            or not re.fullmatch(r"human-[0-9a-f]{20}", value["request_id"])
+            or any(not _sha(value.get(name)) for name in ("head_sha", "original_base_sha", "target_revision"))
+            or value["head_sha"] == value["target_revision"]
+            or not isinstance(value.get("source_review_ids"), list) or not value["source_review_ids"]
+            or any(not _integer(rid) for rid in value["source_review_ids"])
+            or len(value["source_review_ids"]) != len(set(value["source_review_ids"]))
+            or value.get("status") not in {"pending", "consumed", "superseded"}):
+        raise StateError("Malformed trusted document baseline approval")
+    timestamp(value.get("approved_at"))
+    if value["status"] != "pending":
+        timestamp(value.get(value["status"] + "_at"))
+    return deepcopy(value)
+
+
 def _ledger(value: dict) -> dict:
     if (not isinstance(value, dict) or value.get("schema_version") != 1
             or not isinstance(value.get("pulls"), dict)):
@@ -380,6 +404,28 @@ def _ledger(value: dict) -> dict:
                     raise StateError("Archived answer time requires an answered question and response")
         if record["state"] == "needs_user_input" and (question is None or question.get("status") != "posted"):
             raise StateError("Human-input state requires a posted question")
+        approval = record.get("baseline_refresh_approval")
+        if approval is not None:
+            validate_baseline_approval(approval)
+            if approval["status"] == "pending" and (
+                    response is None or response.get("option_id") != "update-docs"
+                    or response.get("request_id") != approval["request_id"]
+                    or response.get("approved_revision") != approval["target_revision"]
+                    or question.get("head_sha") != approval["head_sha"]
+                    or question.get("base_sha") != approval["original_base_sha"]):
+                raise StateError("Pending document approval has no matching owner response")
+        baselines = record.get("baseline_history", [])
+        if not isinstance(baselines, list) or len(baselines) > MAX_BASELINE_HISTORY:
+            raise StateError("Document baseline history exceeds its bounded audit limit")
+        for entry in baselines:
+            if (not isinstance(entry, dict) or set(entry) != {"baseline", "approval", "refreshed_at"}
+                    or not isinstance(entry["baseline"], dict)
+                    or set(entry["baseline"]) - BASELINE_EVIDENCE_FIELDS):
+                raise StateError("Malformed document baseline audit history")
+            validate_baseline_approval(entry["approval"])
+            if entry["approval"]["status"] != "consumed":
+                raise StateError("Baseline audit entry requires a consumed approval")
+            timestamp(entry["refreshed_at"])
     return deepcopy(value)
 
 
@@ -533,12 +579,16 @@ def request_user_input(ledger: dict, feedback: dict, request: dict, *, now: str)
         history.append(archived)
     record.update({"state": "needs_user_input", "updated_at": now,
                    "human_request": request})
+    approval = record.get("baseline_refresh_approval")
+    if approval and approval["status"] == "pending":
+        approval.update(status="superseded", superseded_at=now)
     record.pop("human_response", None)
     record.pop("human_answered_at", None)
     return result
 
 
-def record_user_response(ledger: dict, feedback: dict, response: dict, *, now: str) -> dict:
+def record_user_response(ledger: dict, feedback: dict, response: dict, *, now: str,
+                         trusted_default_revision: str | None = None) -> dict:
     """Record an owner response and make a fresh review eligible.
 
     A response never completes a PR.  It only changes the blocked state back to
@@ -554,15 +604,62 @@ def record_user_response(ledger: dict, feedback: dict, response: dict, *, now: s
         response = human_input.validate_response(response, request)
     except human_input.HumanInputError as exc:
         raise StateError(str(exc)) from exc
+    updating = response.get("option_id") == "update-docs"
     if (not record or record["state"] != "needs_user_input"
             or request["head_sha"] != feedback["head_sha"]
-            or request["base_sha"] != feedback["base_sha"]):
+            or (not updating and request["base_sha"] != feedback["base_sha"])):
         raise StateError("No matching human question is awaiting a response")
+    if updating:
+        revision = response["approved_revision"]
+        if (not _sha(trusted_default_revision) or revision != trusted_default_revision
+                or revision != feedback["base_sha"] or revision == feedback["head_sha"]):
+            raise StateError("Document approval is not the live trusted default commit")
+        record["baseline_refresh_approval"] = {
+            "schema_version": 1, "request_id": response["request_id"],
+            "head_sha": request["head_sha"], "original_base_sha": request["base_sha"],
+            "target_revision": revision, "source_review_ids": list(request["source_review_ids"]),
+            "approved_at": now, "status": "pending",
+        }
     request = deepcopy(request)
     request["status"] = "answered"
     record.update({"state": "needs_review" if response["option_id"] == "stop" else "ready",
                    "updated_at": now, "human_request": request,
                    "human_response": response, "human_answered_at": now})
+    return result
+
+
+def consume_baseline_refresh(record: dict, feedback: dict, *, trusted_revision: str, now: str) -> dict:
+    """Consume one explicit default-document approval without resetting budgets.
+
+    The controller must first verify the snapshot/config at trusted_revision and
+    pass its genuinely post-answer review gate. This function also rejects old
+    question review IDs, active work, stale head/base and PR-candidate baselines.
+    """
+    feedback = _feedback(feedback)
+    timestamp(now)
+    result = deepcopy(record)
+    approval = validate_baseline_approval(result.get("baseline_refresh_approval"))
+    response = result.get("human_response") or {}
+    if (approval["status"] != "pending" or result.get("state") != "ready"
+            or response.get("option_id") != "update-docs"
+            or response.get("request_id") != approval["request_id"]
+            or response.get("approved_revision") != approval["target_revision"]
+            or approval["target_revision"] != trusted_revision
+            or approval["target_revision"] != feedback["base_sha"]
+            or approval["head_sha"] != feedback["head_sha"]
+            or approval["head_sha"] == trusted_revision
+            or set(approval["source_review_ids"]) & set(feedback["source_review_ids"])):
+        raise StateError("Document approval is stale, already consumed or lacks a fresh current review")
+    history = result.setdefault("baseline_history", [])
+    if not isinstance(history, list) or len(history) >= MAX_BASELINE_HISTORY:
+        raise StateError("Document baseline history is full; manual attention required without truncation")
+    approval.update(status="consumed", consumed_at=now)
+    history.append({"baseline": {key: deepcopy(result[key]) for key in BASELINE_EVIDENCE_FIELDS if key in result},
+                    "approval": deepcopy(approval), "refreshed_at": now})
+    for key in BASELINE_EVIDENCE_FIELDS:
+        result.pop(key, None)
+    result["baseline_refresh_approval"] = approval
+    result["updated_at"] = now
     return result
 
 

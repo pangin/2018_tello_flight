@@ -20,7 +20,9 @@ OWNER = "pangin"
 MAX_TEXT = 8 * 1024
 MAX_OPTIONS = 6
 OPTION_IDS = {"clarify", "update-docs", "stop"}
-COMMAND = re.compile(r"(?m)^\s*/review-cycle\s+(clarify|update-docs|stop)\b(?:\s+(.*?))?\s*$")
+COMMAND = re.compile(r"(?m)^[ \t]*/review-cycle[ \t]+(clarify|update-docs|stop)[ \t]+(human-[0-9a-f]{20})(?:[ \t]+([^\r\n]*?))?[ \t]*\r?$")
+COMMAND_LINE = re.compile(r"(?m)^[ \t]*/review-cycle\b")
+REVISION = re.compile(r"[0-9a-f]{40}\Z")
 JSON_FENCE = re.compile(r"^```json[ \t]*\r?\n([\s\S]*?)^```[ \t]*\r?$", re.MULTILINE)
 
 
@@ -96,7 +98,7 @@ def question_body(request):
     request = validate_request(request)
     options = [
         ("clarify", "Provide direction", "Reply with the intended behavior or trade-off; the next Codex review will use it as bounded guidance."),
-        ("update-docs", "Use an ADR/document", "Update the approved ADR or review document, then reply with the path and what changed."),
+        ("update-docs", "Use an ADR/document", "Update the approved default-branch document, then reply with its full trusted default commit SHA, path and decision; never a PR candidate SHA."),
         ("stop", "Keep blocked", "Leave this PR stopped for manual inspection; no automatic edit, push, or merge will occur."),
     ]
     lines = [QUESTION_MARKER, f"@{OWNER} human decision required for `{request['repository']}#{request['pr_number']}`.", "",
@@ -106,9 +108,9 @@ def question_body(request):
     lines += ["No model will edit, push, merge, or declare consensus while this is pending.", "", "Choose one:"]
     lines += [f"- `{key}` — **{label}**: {description}" for key, label, description in options]
     lines += ["", "Reply with one command on its own line:",
-              "`/review-cycle clarify <your direction>`",
-              "`/review-cycle update-docs <path and decision>`",
-              "`/review-cycle stop`"]
+              f"`/review-cycle clarify {request['request_id']} <your direction>`",
+              f"`/review-cycle update-docs {request['request_id']} <full trusted default SHA> <path and decision>`",
+              f"`/review-cycle stop {request['request_id']}`"]
     return "\n".join(lines)
 
 
@@ -136,24 +138,40 @@ def parse_response(body, request, actor):
     if not _text(body):
         raise HumanInputError("Human response is empty")
     value = _json_response(body)
+    commands = COMMAND_LINE.findall(body)
+    if len(commands) > 1 or (value is not None and commands):
+        raise HumanInputError("Exactly one request-bound response is required")
+    approved_revision = None
     if value is None:
-        match = COMMAND.search(body)
-        if not match:
+        matches = list(COMMAND.finditer(body))
+        if len(matches) != 1:
             raise HumanInputError("Reply with one of the requested /review-cycle commands")
-        option_id, message = match.group(1), (match.group(2) or "").strip()
+        match = matches[0]
+        if match.group(2) != request["request_id"]:
+            raise HumanInputError("Human response targets a different question")
+        option_id, message = match.group(1), (match.group(3) or "").strip()
+        if option_id == "update-docs":
+            parts = message.split(None, 1)
+            if len(parts) != 2:
+                raise HumanInputError("Document approval requires a full trusted default SHA and decision")
+            approved_revision, message = parts
     else:
-        if set(value) - {"schema_version", "request_id", "option_id", "message"}:
+        if set(value) - {"schema_version", "request_id", "option_id", "message", "approved_revision"}:
             raise HumanInputError("Human response contains unknown fields")
         if value.get("schema_version", 1) != 1 or value.get("request_id") != request["request_id"]:
             raise HumanInputError("Human response targets a different question")
         option_id, message = value.get("option_id"), value.get("message", "")
+        approved_revision = value.get("approved_revision")
     if option_id not in OPTION_IDS:
         raise HumanInputError("Unknown human response option")
     if option_id != "stop" and not _text(message):
         raise HumanInputError("A direction or document path is required")
     if not isinstance(message, str) or len(message.encode()) > MAX_TEXT:
         raise HumanInputError("Human response is too large")
-    return {
+    if ((option_id == "update-docs" and (not isinstance(approved_revision, str) or not REVISION.fullmatch(approved_revision)))
+            or (option_id != "update-docs" and approved_revision is not None)):
+        raise HumanInputError("Only document approval carries an exact trusted default revision")
+    result = {
         "schema_version": 1,
         "request_id": request["request_id"],
         "option_id": option_id,
@@ -162,6 +180,9 @@ def parse_response(body, request, actor):
         "actor_id": actor.get("id"),
         "body_sha256": hashlib.sha256(body.encode()).hexdigest(),
     }
+    if approved_revision is not None:
+        result["approved_revision"] = approved_revision
+    return result
 
 
 def validate_response(response, request):
@@ -174,6 +195,10 @@ def validate_response(response, request):
             or response.get("actor_login") != OWNER
             or not _text(response.get("body_sha256"), maximum=80)):
         raise HumanInputError("Malformed human response")
+    revision = response.get("approved_revision")
+    if ((response["option_id"] == "update-docs" and (not isinstance(revision, str) or not REVISION.fullmatch(revision)))
+            or (response["option_id"] != "update-docs" and revision is not None)):
+        raise HumanInputError("Document approval requires its exact trusted default revision")
     return deepcopy(response)
 
 

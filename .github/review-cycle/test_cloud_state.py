@@ -30,7 +30,7 @@ def repo():
 
 def pr(head=HEAD, base=BASE):
     return {"number": 7, "state": "open", "draft": False, "user": {"login": "pangin"},
-            "created_at": "2026-09-30T00:01:00Z",
+            "created_at": "2026-09-30T00:01:00Z", "changed_files": 1,
             "head": {"sha": head, "repo": repo()}, "base": {"sha": base, "repo": repo()}}
 
 
@@ -309,7 +309,7 @@ class LedgerTests(unittest.TestCase):
         blocked = state.request_user_input(pushed, fresh, request, now=NOW)
         with self.assertRaises(state.StateError):
             self.unlimited_reserve(blocked, feedback(head=NEXT, rid=12), "waiting-human")
-        response = human_input.parse_response("/review-cycle stop", request,
+        response = human_input.parse_response(f"/review-cycle stop {request['request_id']}", request,
                                               {"login": "pangin", "type": "User"})
         stopped = state.record_user_response(blocked, fresh, response, now=NOW)
         with self.assertRaises(state.StateError):

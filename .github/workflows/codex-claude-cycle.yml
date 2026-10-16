@@ -6,7 +6,9 @@ on:
   issue_comment:
     types: [created]
   workflow_run:
-    workflows: [Review cycle controller checks]
+    # Subscribe broadly; the trusted API/profile gate below rejects unrelated,
+    # stale and cross-repository runs before any privileged model/publish step.
+    workflows: ['*']
     types: [completed]
 
 permissions:
@@ -38,7 +40,6 @@ jobs:
         github.event.pull_request.head.repo.full_name == github.repository) ||
        (github.event_name == 'workflow_run' &&
         github.event.workflow_run.event == 'pull_request' &&
-        github.event.workflow_run.conclusion == 'success' &&
         github.event.workflow_run.head_repository.full_name == github.repository &&
         github.event.workflow_run.pull_requests[0].number > 0) ||
        (github.event_name == 'issue_comment' &&
@@ -55,19 +56,28 @@ jobs:
           persist-credentials: false
 
       - name: Preserve trusted control code outside the model workspace
+        id: trusted
         run: |
+          if [ ! -e .github/review-cycle ]; then
+            echo 'enrolled=false' >> "$GITHUB_OUTPUT"
+            echo 'Trusted default branch is not enrolled yet; setup PR event skipped without inference or publishing.'
+            exit 0
+          fi
+          test -f .github/review-cycle/cloud_controller.py
+          test -f .github/review-cycle/config.json
           cp -R .github/review-cycle "$RUNNER_TEMP/review-cycle"
           chmod +x "$RUNNER_TEMP/review-cycle/git_askpass.py"
+          echo 'enrolled=true' >> "$GITHUB_OUTPUT"
 
       - name: Record an authorized human direction
-        if: github.event_name == 'issue_comment'
+        if: steps.trusted.outputs.enrolled == 'true' && github.event_name == 'issue_comment'
         env:
           GH_TOKEN: ${{ github.token }}
         run: python3 "$RUNNER_TEMP/review-cycle/cloud_controller.py" respond
 
       - name: Verify current review or CI and reserve a bounded assessment
         id: prepare
-        if: github.event_name != 'issue_comment'
+        if: steps.trusted.outputs.enrolled == 'true' && github.event_name != 'issue_comment'
         env:
           GH_TOKEN: ${{ github.token }}
           HAS_CLAUDE_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN != '' }}

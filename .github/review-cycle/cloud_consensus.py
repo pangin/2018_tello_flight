@@ -17,6 +17,56 @@ import human_input
 
 REQUEST_MARKER = "<!-- review-cycle-request:v1 -->"
 VERDICT_MARKER = "<!-- review-cycle-verdict:v1 -->"
+CI_FAILURE_MARKER = "<!-- review-cycle-ci-failure:v1 -->"
+CI_FAILURE_CONCLUSIONS = {"action_required", "cancelled", "failure", "neutral", "skipped",
+                          "stale", "startup_failure", "timed_out"}
+
+
+class RequiredCIFailed(state.StateError):
+    """Canonical current-candidate required CI completed without success."""
+
+    def __init__(self, failures):
+        super().__init__("Required CI completed unsuccessfully; manual attention is required")
+        self.failures = deepcopy(failures)
+
+
+def workflow_path(value):
+    """Normalize GitHub's optional @ref suffix without accepting arbitrary paths.
+
+    The suffix is data, never a URL or a fetch target. Repository, candidate and
+    PR head/base associations remain mandatory independent identity checks.
+    """
+    if not isinstance(value, str) or len(value) > 512 or value.count("@") > 1:
+        raise state.StateError("Invalid GitHub Actions workflow path")
+    path, separator, ref = value.partition("@")
+    if not re.fullmatch(r"\.github/workflows/[A-Za-z0-9_-]+\.ya?ml", path):
+        raise state.StateError("Invalid GitHub Actions workflow path")
+    if separator and (not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]*", ref)
+                      or ".." in ref or "//" in ref or ref.endswith(("/", "."))
+                      or any(part.startswith(".") or part.endswith(".lock") for part in ref.split("/"))):
+        raise state.StateError("Invalid GitHub Actions workflow ref")
+    return path
+
+
+def validate_ci_run(run, feedback, approved_workflows, *, require_completed=True):
+    """Bind a canonical completed PR run to the exact current candidate pair."""
+    repo, head = feedback["repository"], feedback["head_sha"]
+    if (not isinstance(run, dict) or type(run.get("id")) is not int or run["id"] <= 0
+            or run.get("head_sha") != head or (run.get("repository") or {}).get("full_name") != repo
+            or (run.get("head_repository") or {}).get("full_name") != repo
+            or workflow_path(run.get("path")) not in approved_workflows
+            or (require_completed and run.get("status") != "completed")
+            or run.get("event") != "pull_request"):
+        raise state.StateError("Required CI workflow identity does not match the approved profile")
+    pulls = run.get("pull_requests")
+    if not isinstance(pulls, list):
+        raise state.StateError("Malformed CI pull-request associations")
+    associations = [pull for pull in pulls if isinstance(pull, dict)
+                    and pull.get("number") == feedback["pr_number"]]
+    if (len(associations) != 1 or associations[0].get("head", {}).get("sha") != head
+            or associations[0].get("base", {}).get("sha") != feedback["base_sha"]):
+        return False  # A changed base requires fresh CI, never old failure/success.
+    return True
 
 
 def validate_ci_profile(profile):
@@ -123,37 +173,84 @@ def required_ci(api, feedback, profile):
             break
     else:
         raise state.StateError("CI pagination limit exceeded")
-    ids = []
+    ids, failures, pending = [], [], False
     for item in profile:
         matches = [check for check in checks if check.get("name") == item["name"]
                    and (check.get("app") or {}).get("id") == item["app_id"]
                    and (check.get("app") or {}).get("slug") == item["app_slug"]]
         if not matches:
-            return None
+            pending = True
+            continue
         if any(type(check.get("id")) is not int or check["id"] <= 0 for check in matches):
             raise state.StateError("Invalid required check identity")
         check = max(matches, key=lambda row: row["id"])
         if check.get("head_sha") != head:
             raise state.StateError("Required CI targets a stale commit")
-        if check.get("status") != "completed" or check.get("conclusion") != "success":
-            return None
+        if check.get("status") != "completed":
+            pending = True
+            continue
         match = re.fullmatch(r"https://github\.com/" + re.escape(repo)
                              + r"/actions/runs/([1-9][0-9]*)/job/([1-9][0-9]*)", check.get("details_url", ""))
         if not match or int(match[2]) != check["id"]:
             raise state.StateError("Required CI has no canonical workflow/job link")
         run = api.request(f"repos/{repo}/actions/runs/{match[1]}")
-        if (run.get("head_sha") != head or (run.get("repository") or {}).get("full_name") != repo
-                or (run.get("head_repository") or {}).get("full_name") != repo
-                or run.get("path") != item["workflow"] or run.get("status") != "completed"
-                or run.get("conclusion") != "success" or run.get("event") != "pull_request"):
+        if run.get("id") != int(match[1]):
             raise state.StateError("Required CI workflow identity does not match the approved profile")
-        associations = [pull for pull in run.get("pull_requests", []) if pull.get("number") == feedback["pr_number"]]
-        if (len(associations) != 1 or associations[0].get("head", {}).get("sha") != head
-                or associations[0].get("base", {}).get("sha") != feedback["base_sha"]):
-            return None  # CI must be re-run when its associated base changes.
+        if not validate_ci_run(run, feedback, {item["workflow"]}, require_completed=False):
+            pending = True
+            continue
+        if run.get("status") != "completed":
+            pending = True
+            continue
+        conclusions = {check.get("conclusion"), run.get("conclusion")}
+        if any(conclusion not in CI_FAILURE_CONCLUSIONS | {"success"} for conclusion in conclusions):
+            raise state.StateError("Required CI has an invalid completed conclusion")
+        if conclusions != {"success"}:
+            failures.append({"check_run_id": check["id"], "workflow_run_id": run["id"],
+                             "workflow": item["workflow"],
+                             "conclusions": sorted(conclusions - {"success"})})
+            continue
         ids.append(check["id"])
+    if failures:
+        raise RequiredCIFailed(failures)
+    if pending:
+        return None
     return {"repository": repo, "head_sha": head, "base_sha": feedback["base_sha"],
             "tests_passed": True, "required_ci_passed": True, "check_run_ids": sorted(ids)}
+
+
+def notify_ci_failure(c, root, api, feedback, ledger, cid, failure):
+    """Persist a non-retrying stop, then visibly notify the owner exactly once."""
+    record = ledger["pulls"].setdefault(f"{feedback['repository']}#{feedback['pr_number']}",
+                                      {"state": "ready", "attempts": 0,
+                                       "processed_review_ids": [], "processed_heads": []})
+    if (record["state"] in {"processing", "verifying", "needs_user_input", "failed", "complete"}
+            or (record.get("human_response") or {}).get("option_id") == "stop"):
+        print("Required CI failed; existing reservation or human/terminal stop is preserved.")
+        return
+    prior = record.get("ci_failure")
+    if isinstance(prior, dict) and all(prior.get(key) == feedback[key] for key in ("head_sha", "base_sha")):
+        if prior.get("notification_status") != "posted":
+            raise state.StateError("CI failure notification was interrupted; inspect before retrying")
+        print("Required CI failure is already recorded and the owner was notified.")
+        return
+    record.update(state="needs_review", updated_at=c.now(),
+                  ci_failure={"head_sha": feedback["head_sha"], "base_sha": feedback["base_sha"],
+                              "failures": deepcopy(failure.failures), "notification_status": "posting"})
+    cid = c.ledger_write(api, feedback["repository"], feedback["pr_number"], cid, ledger,
+                         "Required CI completed unsuccessfully for the current head/base. "
+                         "Stopped for manual attention; no model, tests, push or consensus was started.")
+    response = api.request(f"repos/{feedback['repository']}/issues/{feedback['pr_number']}/comments", "POST",
+                           {"body": CI_FAILURE_MARKER + "\n@" + state.OWNER
+                            + " required GitHub Actions CI completed unsuccessfully for the current PR candidate. "
+                            "The cycle is stopped as `needs_review`, not waiting for CI. "
+                            "Please inspect the Actions failure and resolve it explicitly; "
+                            "no automatic retry, edit, push, merge or consensus is permitted."})
+    if type(response.get("id")) is not int or response["id"] <= 0:
+        raise state.StateError("CI failure notification returned no valid identity")
+    record["ci_failure"].update(notification_status="posted", comment_id=response["id"])
+    c.ledger_write(api, feedback["repository"], feedback["pr_number"], cid, ledger,
+                   "Required CI failure recorded and repository owner notified. Manual attention is required.")
 
 
 def trusted_ci_files(workspace, feedback, snapshot, profile):
@@ -248,7 +345,11 @@ def prepare(c, root, api, config, feedback, pr, reviews, identity, ledger, cid, 
                               kind="native_verdict", sources=["native Codex evidence", snapshot["sha256"]])
         return
     trusted_ci_files(workspace, feedback, snapshot, record["review_required_ci"])
-    ci = required_ci(api, feedback, record["review_required_ci"])
+    try:
+        ci = required_ci(api, feedback, record["review_required_ci"])
+    except RequiredCIFailed as failure:
+        notify_ci_failure(c, root, api, feedback, ledger, cid, failure)
+        return
     if ci is None:
         c.ledger_write(api, feedback["repository"], feedback["pr_number"], cid, ledger,
                        "Native verdict received; waiting for approved CI on the current head/base. No model call yet.")

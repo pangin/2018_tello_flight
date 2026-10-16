@@ -61,6 +61,15 @@ visible question mentioning the repository owner on the PR, and record the
 question/response. Accept only the owner-scoped `/review-cycle` response or an
 explicitly identified approved ADR/document update. Do not continue silently
 with an open question; the answer requires fresh current-SHA review evidence.
+Commands must carry the exact displayed request ID; a reply to an older question
+cannot authorize its replacement. Use `/review-cycle clarify <request-id> <direction>`
+or `/review-cycle stop <request-id>`. To approve a new document baseline, use
+`/review-cycle update-docs <request-id> <full-trusted-default-commit-sha> <path and decision>`.
+Only the exact current trusted default commit and unchanged questioned candidate
+head may be approved. This transition archives old baseline evidence, invalidates
+its verdicts and tests, and requires fresh independent reviews; it does not reset
+attempt history or grant new permissions. An ordinary default-branch movement
+never silently replaces the pinned baseline.
 
 ## Marked final verdict and completion
 

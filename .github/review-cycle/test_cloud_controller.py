@@ -423,9 +423,11 @@ class ControllerTests(unittest.TestCase):
         c.save(path, {**c.load(path), "readiness": "pending", "test_commands": []})
         with patch.dict(os.environ, env, clear=True), patch.object(c, "now", return_value=NOW):
             c.prepare(self.root, self.root / "event.json", path, self.api)
+            _, pending_ledger = c.ledger_read(self.api, "pangin/example", 7)
+            request_id = pending_ledger["pulls"]["pangin/example#7"]["human_request"]["request_id"]
             c.save(self.root / "answer.json", {"action": "created", "issue": {"number": 7,
                 "pull_request": {"url": "unused"}}, "comment": {"user": {"login": "pangin", "type": "User"},
-                "body": "/review-cycle clarify Skip missing tests and run anyway."}})
+                "body": f"/review-cycle clarify {request_id} Skip missing tests and run anyway."}})
             c.respond(self.root, self.root / "answer.json", self.api)
         old_pages = self.api.pages.side_effect
         def pages(route):
@@ -468,7 +470,8 @@ class ControllerTests(unittest.TestCase):
             if route == "repos/pangin/example/actions/runs/42":
                 return {"id": 42, "event": "pull_request", "status": "completed", "conclusion": "success",
                         "repository": repo(), "head_repository": repo(), "head_sha": self.head,
-                        "path": ".github/workflows/review-cycle-checks.yml", "pull_requests": [{"number": 7}]}
+                        "path": ".github/workflows/review-cycle-checks.yml", "pull_requests": [
+                            {"number": 7, "head": {"sha": self.head}, "base": {"sha": "b" * 40}}]}
             return original_request(route, method, payload)
         self.api.request.side_effect = request
         with patch.dict(os.environ, env, clear=True), patch.object(c, "output") as outputs:
@@ -607,7 +610,7 @@ class ControllerTests(unittest.TestCase):
         ledger["pulls"]["pangin/example#7"]["human_request"].update(status="posted", comment_id=101)
         body = c.MARKER + "\n```json\n" + json.dumps(ledger) + "\n```"
         event = {"action": "created", "issue": {"number": 7, "pull_request": {"url": "x"}},
-                 "comment": {"body": "/review-cycle clarify Keep the documented behavior.",
+                 "comment": {"body": f"/review-cycle clarify {request['request_id']} Keep the documented behavior.",
                              "user": {"login": "pangin", "type": "User", "id": 1}}}
         event_path = self.root / "comment-event.json"; c.save(event_path, event)
         candidate = pr(head=fb["head_sha"], base=fb["base_sha"])

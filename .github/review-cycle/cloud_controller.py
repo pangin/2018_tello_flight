@@ -245,19 +245,35 @@ def respond(root, event_path, api):
     if record.get("state") != "needs_user_input" or not request:
         print("No human question is awaiting a response.")
         return
-    pr = api.request(f"repos/{repo}/pulls/{number}")
-    if (pr.get("state") != "open" or (pr.get("head") or {}).get("sha") != request["head_sha"]
-            or (pr.get("base") or {}).get("sha") != request["base_sha"]):
-        raise state.StateError("Human response targets a stale PR head/base")
-    feedback = {"schema_version": 1, "repository": repo, "pr_number": number,
-                "head_sha": request["head_sha"], "base_sha": request["base_sha"],
-                "source_review_ids": request["source_review_ids"], "findings": []}
     try:
         response = human_input.parse_response(event.get("comment", {}).get("body", ""), request, actor)
     except human_input.HumanInputError as exc:
         print(f"Human response ignored: {exc}")
         return
-    updated = state.record_user_response(ledger, feedback, response, now=now())
+    pr = api.request(f"repos/{repo}/pulls/{number}")
+    if pr.get("state") != "open" or (pr.get("head") or {}).get("sha") != request["head_sha"]:
+        raise state.StateError("Human response targets a stale PR head")
+    trusted_revision = None
+    if response["option_id"] == "update-docs":
+        repository = api.request(f"repos/{repo}")
+        base = pr.get("base") or {}
+        trusted_revision = git(Path(os.environ.get("GITHUB_WORKSPACE", ".")), "rev-parse", "HEAD").strip()
+        if (repository.get("full_name") != repo or repository.get("fork") is not False
+                or repository.get("archived") is not False or not repository.get("default_branch")
+                or base.get("ref") != repository["default_branch"]
+                or (base.get("repo") or {}).get("full_name") != repo
+                or ((pr.get("head") or {}).get("repo") or {}).get("full_name") != repo
+                or trusted_revision != base.get("sha")
+                or response["approved_revision"] != trusted_revision
+                or trusted_revision == request["head_sha"]):
+            raise state.StateError("Document approval must name the freshly checked-out live trusted default commit")
+    elif (pr.get("base") or {}).get("sha") != request["base_sha"]:
+        raise state.StateError("Human response targets a stale PR base")
+    feedback = {"schema_version": 1, "repository": repo, "pr_number": number,
+                "head_sha": request["head_sha"], "base_sha": pr["base"]["sha"],
+                "source_review_ids": request["source_review_ids"], "findings": []}
+    updated = state.record_user_response(ledger, feedback, response, now=now(),
+                                         trusted_default_revision=trusted_revision)
     note = ("Owner direction recorded for `" + response["request_id"] + "`: `"
             + response["option_id"] + "`. A fresh canonical Codex review is still required.\n\n"
             + human_input.response_context(response))
@@ -286,6 +302,22 @@ def pin_documents(workspace, config, ledger, feedback, changed_paths):
     """Pin criteria before inference; never silently change an existing baseline."""
     key = f"{feedback['repository']}#{feedback['pr_number']}"
     record = ledger["pulls"].get(key, {})
+    approval = record.get("baseline_refresh_approval") or {}
+    if approval.get("status") == "pending":
+        trusted_revision = git(workspace, "rev-parse", "HEAD").strip()
+        # Config and document paths come exclusively from the freshly checked
+        # out trusted default branch, never from the owner's comment or PR.
+        snapshot = review_documents.build_snapshot(workspace, trusted_revision,
+                                                    config.get("review_documents"), changed_paths)
+        cloud_consensus.validate_execution_profile(config, snapshot)
+        refreshed = state.consume_baseline_refresh(record, feedback,
+                                                   trusted_revision=trusted_revision, now=now())
+        refreshed.update(document_revision=snapshot["revision"], document_fingerprint=snapshot["sha256"],
+                         document_paths=[item["path"] for item in snapshot["documents"]])
+        # New manifest/task/CI and native verification request are reconstructed
+        # by normal prepare processing only after obsolete evidence is removed.
+        ledger["pulls"][key] = refreshed
+        return snapshot
     has_baseline = "document_revision" in record or "document_fingerprint" in record
     if has_baseline and not all(name in record for name in
                                 ("document_revision", "document_fingerprint", "document_paths")):
@@ -352,6 +384,34 @@ def protect_documents(paths, job, workspace):
         raise state.StateError("The patch introduces new scoped criteria; approve a new baseline explicitly")
 
 
+def changed_pr_paths(pr, files):
+    """Require GitHub's complete file set before selecting scoped criteria.
+
+    REST returns at most 3,000 PR files. A capped/inconsistent response must
+    never silently omit an instruction directory from the document baseline.
+    """
+    count = pr.get("changed_files") if isinstance(pr, dict) else None
+    if (type(count) is not int or not 0 <= count <= 3000
+            or not isinstance(files, list) or len(files) != count):
+        raise state.StateError("Complete PR changed-file metadata is unavailable")
+    names, paths = set(), set()
+    for item in files:
+        if not isinstance(item, dict):
+            raise state.StateError("Malformed PR changed-file metadata")
+        try:
+            name = review_documents._path(item.get("filename"))
+            if name in names:
+                raise state.StateError("Duplicate PR changed-file metadata")
+            names.add(name); paths.add(name)
+            if item.get("status") == "renamed":
+                paths.add(review_documents._path(item.get("previous_filename")))
+            elif "previous_filename" in item:
+                raise state.StateError("Unexpected PR rename metadata")
+        except review_documents.DocumentError:
+            raise state.StateError("Noncanonical PR changed-file metadata") from None
+    return sorted(paths)
+
+
 def prepare(root, event_path, config_path, api):
     config = state.validate_config(load(config_path))
     output("run_claude", "false")
@@ -378,11 +438,11 @@ def prepare(root, event_path, config_path, api):
             # inference, test, publish or final verdict for this configuration.
             approved_workflows = {".github/workflows/review-cycle-checks.yml"}
         pulls = run.get("pull_requests", [])
-        if (run.get("event") != "pull_request" or run.get("status") != "completed"
-                or run.get("conclusion") != "success" or len(pulls) != 1
+        if (run.get("id") != run_id or run.get("event") != "pull_request" or run.get("status") != "completed"
+                or not isinstance(pulls, list) or len(pulls) != 1
                 or (run.get("repository") or {}).get("full_name") != repo
                 or (run.get("head_repository") or {}).get("full_name") != repo
-                or run.get("path") not in approved_workflows
+                or cloud_consensus.workflow_path(run.get("path")) not in approved_workflows
                 or not state._sha(run.get("head_sha"))):
             raise state.StateError("Only approved same-repository PR CI may resume final verification")
         number = pulls[0].get("number")
@@ -395,6 +455,11 @@ def prepare(root, event_path, config_path, api):
     pr = api.request(f"repos/{repo}/pulls/{number}")
     if resume_ci and pr["head"]["sha"] != run["head_sha"]:
         print("CI completion concerns an older PR head; skipped.")
+        return
+    if resume_ci and not cloud_consensus.validate_ci_run(
+            run, {"repository": repo, "pr_number": number, "head_sha": pr["head"]["sha"],
+                  "base_sha": pr["base"]["sha"]}, approved_workflows):
+        print("CI completion concerns an older PR head/base association; skipped.")
         return
     reviews = api.pages(f"repos/{repo}/pulls/{number}/reviews")
     comments = api.pages(f"repos/{repo}/pulls/{number}/comments")
@@ -416,6 +481,20 @@ def prepare(root, event_path, config_path, api):
         return
     live_pr(api, feedback)
     cid, ledger = ledger_read(api, repo, number)
+    if resume_ci:
+        record = ledger["pulls"].get(f"{repo}#{number}", {})
+        try:
+            ci_profile = cloud_consensus.validate_ci_profile(
+                record.get("review_required_ci", config.get("required_ci")))
+        except state.StateError:
+            ci_profile = None  # Pending enrollment may only ask readiness below.
+        if ci_profile is not None:
+            try:
+                cloud_consensus.required_ci(api, feedback, ci_profile)
+            except cloud_consensus.RequiredCIFailed as failure:
+                cloud_consensus.notify_ci_failure(sys.modules[__name__], root, api,
+                                                  feedback, ledger, cid, failure)
+                return
     fresh_reviews = human_review_gate(root, api, feedback, ledger, cid, reviews, identity,
                                       trigger_id=None if resume_ci else trigger.get("id"))
     if fresh_reviews is None:
@@ -467,11 +546,20 @@ def prepare(root, event_path, config_path, api):
         return
     record = ledger["pulls"].get(f"{repo}#{number}", {})
     files = api.pages(f"repos/{repo}/pulls/{number}/files")
-    if any(not isinstance(item, dict) or not isinstance(item.get("filename"), str) for item in files):
-        raise state.StateError("Malformed PR changed-file list")
+    # A branch movement is not authority to post a stale human question.
+    pr = live_pr(api, feedback)
+    try:
+        changed_paths = changed_pr_paths(pr, files)
+    except state.StateError:
+        request_human_input(root, api, feedback, ledger, cid,
+                            "The complete current PR changed-file list could not be verified. "
+                            "Please split an oversized PR or inspect its file metadata before "
+                            "automatic work; no scoped document baseline or attempt was created.",
+                            kind="criteria_conflict", sources=["current PR changed-file metadata"])
+        return
     try:
         snapshot = pin_documents(Path(os.environ["GITHUB_WORKSPACE"]), config, ledger,
-                                 feedback, [item["filename"] for item in files])
+                                 feedback, changed_paths)
         record = ledger["pulls"][f"{repo}#{number}"]
         cloud_consensus.validate_execution_profile(config, snapshot)
         cloud_consensus.pin_manifest(config, snapshot, record, pr)
@@ -602,7 +690,7 @@ def test_container(workspace, config, root):
             raise state.StateError("Submodules/special files are unsupported")
     name = "review-cycle-" + uuid.uuid4().hex
     env = {key: os.environ[key] for key in ("PATH", "HOME") if key in os.environ}
-    base = ["docker", "run", "-d", "--name", name, "--user", "1000:1000", "--cap-drop", "ALL",
+    base = ["docker", "run", "-d", "--name", name, "--network=none", "--user", "1000:1000", "--cap-drop", "ALL",
             "--security-opt", "no-new-privileges", "--pids-limit", "256", "--memory", "2g", "--cpus", "2",
             "--mount", f"type=bind,src={source},dst=/source,readonly",
             "--tmpfs", "/work:rw,nosuid,nodev,mode=1777", "--tmpfs", "/tmp:rw,nosuid,nodev,mode=1777",

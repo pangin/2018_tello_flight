@@ -30,7 +30,7 @@ class HumanInputTests(unittest.TestCase):
         self.assertIn(self.request["request_id"], body)
 
     def test_owner_command_response_is_structured(self):
-        result = h.parse_response("/review-cycle clarify Keep the compatibility behavior.", self.request, self.actor)
+        result = h.parse_response(f"/review-cycle clarify {self.request['request_id']} Keep the compatibility behavior.", self.request, self.actor)
         self.assertEqual(result["option_id"], "clarify")
         self.assertEqual(result["message"], "Keep the compatibility behavior.")
         self.assertEqual(h.validate_response(result, self.request), result)
@@ -38,7 +38,7 @@ class HumanInputTests(unittest.TestCase):
     def test_marked_json_response_requires_exact_request(self):
         body = h.RESPONSE_MARKER + "\n```json\n" + json.dumps({
             "schema_version": 1, "request_id": self.request["request_id"],
-            "option_id": "update-docs", "message": "Use ADR-12."
+            "option_id": "update-docs", "message": "Use ADR-12.", "approved_revision": "c" * 40
         }) + "\n```"
         result = h.parse_response(body, self.request, self.actor)
         self.assertEqual(result["option_id"], "update-docs")
@@ -52,7 +52,7 @@ class HumanInputTests(unittest.TestCase):
             h.parse_response("/review-cycle clarify", self.request, {"login": "someone-else", "type": "User"})
 
     def test_stop_needs_no_message(self):
-        result = h.parse_response("/review-cycle stop", self.request, self.actor)
+        result = h.parse_response(f"/review-cycle stop {self.request['request_id']}", self.request, self.actor)
         self.assertEqual(result["option_id"], "stop")
         self.assertEqual(result["message"], "")
 

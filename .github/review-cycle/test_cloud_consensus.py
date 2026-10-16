@@ -137,11 +137,11 @@ class AdapterTests(unittest.TestCase):
     def test_unlimited_fixes_still_require_explicit_same_sha_consensus(self):
         self.config["max_rounds"] = None
         self.record["attempts"] = 100
-        self.check["conclusion"] = "failure"
+        self.check.update(status="in_progress", conclusion=None)
         outputs = self.prepare()
         self.assertNotEqual(outputs.get("run_claude"), "true")
         self.assertNotEqual(self.record["state"], "complete")
-        self.check["conclusion"] = "success"
+        self.check.update(status="completed", conclusion="success")
         self.assertEqual(self.prepare()["run_claude"], "true")
         self.complete().assert_called_once()
         self.assertEqual(self.record["state"], "complete")
