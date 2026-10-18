@@ -144,6 +144,44 @@ class ConfigTests(unittest.TestCase):
             state.validate_config(missing)
 
 
+class ReviewEventPairTests(unittest.TestCase):
+    def test_exact_live_comparison_and_case_insensitive_repository_match(self):
+        event = pr()
+        event["head"]["repo"]["full_name"] = "PANGIN/Example"
+        self.assertTrue(state.validate_review_event_pair(event, pr()))
+
+    def test_valid_stale_head_base_or_number_does_not_rebind_a_review(self):
+        for candidate in [pr(head=NEXT), pr(base=NEXT), {**pr(), "number": 8}]:
+            with self.subTest(candidate=candidate):
+                self.assertFalse(state.validate_review_event_pair(candidate, pr()))
+                self.assertFalse(state.validate_review_event_pair(pr(), candidate))
+
+    def test_cross_repository_comparison_is_ineligible_even_when_both_payloads_agree(self):
+        event = pr()
+        event["head"]["repo"]["full_name"] = "pangin/other"
+        self.assertFalse(state.validate_review_event_pair(event, pr()))
+        self.assertFalse(state.validate_review_event_pair(event, deepcopy(event)))
+        for side in ("head", "base"):
+            event[side]["repo"]["full_name"] = "someone/example"
+        self.assertFalse(state.validate_review_event_pair(event, pr()))
+
+    def test_malformed_shape_fails_closed_instead_of_becoming_a_stale_event(self):
+        candidates = [None, [], {}, {**pr(), "number": True}, {**pr(), "number": 0},
+                      {**pr(), "head": None}, {**pr(), "base": []}]
+        for side in ("head", "base"):
+            for patch in [{"sha": None}, {"sha": "a" * 39}, {"sha": "A" * 40},
+                          {"repo": None}, {"repo": {}}, {"repo": {"full_name": "pangin"}},
+                          {"repo": {"full_name": "pangin/example/extra"}}]:
+                candidate = pr()
+                candidate[side].update(patch)
+                candidates.append(candidate)
+        for candidate in candidates:
+            with self.subTest(candidate=candidate), self.assertRaises(state.StateError):
+                state.validate_review_event_pair(candidate, pr())
+            with self.subTest(live=candidate), self.assertRaises(state.StateError):
+                state.validate_review_event_pair(pr(), candidate)
+
+
 class FeedbackTests(unittest.TestCase):
     def collect(self, **changes):
         values = {"config": config(), "repository": repo(), "pr": pr(),
@@ -587,6 +625,147 @@ class HumanInputStateTests(unittest.TestCase):
                     "option_id": option, "message": "Keep the documented behavior.",
                     "actor_login": "pangin", "actor_id": 1, "body_sha256": "f" * 64}
         return state.record_user_response(ledger, fb, response, now=NOW)
+
+    def previously_handled_answer(self):
+        ledger = state.finish(reserve(), feedback(), run_id="run-1", outcome="needs_review", now=NOW)
+        ledger["pulls"]["pangin/example#7"].update(verification_attempts={HEAD: 1},
+                                                   failure_audit={"old": "preserve"})
+        return self.answer(self.posted(ledger=ledger))
+
+    def test_owner_clarification_allows_one_fresh_same_head_fix_without_resetting_history(self):
+        original = self.previously_handled_answer()
+        before = deepcopy(original)
+        result = reserve(original, feedback(rid=11), run="owner-resume")
+        record = result["pulls"]["pangin/example#7"]
+        self.assertEqual(record["attempts"], 2)
+        self.assertEqual(record["processed_heads"], [HEAD])
+        self.assertEqual(record["processed_review_ids"], [10, 11])
+        self.assertEqual(record["verification_attempts"], {HEAD: 1})
+        self.assertEqual(record["failure_audit"], {"old": "preserve"})
+        self.assertEqual(record["last_run_id"], "run-1")
+        self.assertEqual(record["human_fix_resume"], {
+            **before["pulls"]["pangin/example#7"]["human_fix_resume"],
+            "status": "consumed", "consumed_at": NOW, "run_id": "owner-resume", "resumed_review_ids": [11]})
+        state._ledger(result)
+        self.assertEqual(original, before)
+        finished = state.finish(result, feedback(rid=11), run_id="owner-resume", outcome="pushed",
+                                pushed_head_sha=NEXT, now=NOW)
+        with self.assertRaises(state.StateError):
+            reserve(finished, feedback(rid=12), run="must-not-reuse-answer")
+
+    def test_resume_rejects_old_or_mixed_reviews_and_changed_base(self):
+        original = self.previously_handled_answer()
+        mixed = feedback(rid=11)
+        mixed["source_review_ids"] = [10, 11]
+        for fb in [feedback(), mixed, feedback(base=NEXT, rid=11)]:
+            with self.subTest(feedback=fb), self.assertRaises(state.StateError):
+                reserve(original, fb, run="not-fresh-current")
+        self.assertEqual(original["pulls"]["pangin/example#7"]["human_fix_resume"]["status"], "pending")
+
+    def test_resume_does_not_replenish_fix_cap_or_verification_budget(self):
+        original = self.previously_handled_answer()
+        record = original["pulls"]["pangin/example#7"]
+        record["attempts"] = 3
+        with self.assertRaises(state.StateError):
+            reserve(original, feedback(rid=11))
+        self.assertEqual(record["human_fix_resume"]["status"], "pending")
+        unlimited = state.reserve(original, feedback(rid=11), live_head_sha=HEAD, live_base_sha=BASE,
+                                  run_id="explicit-unlimited", now=NOW, max_rounds=None)
+        self.assertEqual(unlimited["pulls"]["pangin/example#7"]["attempts"], 4)
+        self.assertEqual(unlimited["pulls"]["pangin/example#7"]["verification_attempts"], {HEAD: 1})
+
+    def test_stop_failure_active_work_and_ci_failure_are_not_released_by_resume(self):
+        stopped = self.answer(self.posted(), option="stop")
+        self.assertNotIn("human_fix_resume", stopped["pulls"]["pangin/example#7"])
+        with self.assertRaises(state.StateError):
+            reserve(stopped, feedback(rid=11))
+        for blocked in ("failed", "needs_review", "processing", "verifying", "needs_user_input"):
+            original = self.previously_handled_answer()
+            original["pulls"]["pangin/example#7"]["state"] = blocked
+            with self.subTest(state=blocked), self.assertRaises(state.StateError):
+                reserve(original, feedback(rid=11))
+        failed = state.finish(reserve(), feedback(), run_id="run-1", outcome="failed", now=NOW)
+        with self.assertRaises(state.StateError):
+            self.posted(ledger=failed)
+        original = self.previously_handled_answer()
+        original["pulls"]["pangin/example#7"]["ci_failure"] = {"head_sha": HEAD, "base_sha": BASE}
+        with self.assertRaises(state.StateError):
+            reserve(original, feedback(rid=11))
+        pending = self.posted(ledger=state.finish(reserve(), feedback(), run_id="run-1",
+                                                 outcome="needs_review", now=NOW))
+        pending["pulls"]["pangin/example#7"]["ci_failure"] = {"head_sha": HEAD, "base_sha": BASE}
+        answered = self.answer(pending)
+        self.assertNotIn("human_fix_resume", answered["pulls"]["pangin/example#7"])
+        with self.assertRaises(state.StateError):
+            reserve(answered, feedback(rid=11))
+
+    def test_new_candidate_or_clean_review_supersedes_unused_same_head_exception(self):
+        original = self.previously_handled_answer()
+        changed = reserve(original, feedback(head=NEXT, rid=11))
+        self.assertEqual(changed["pulls"]["pangin/example#7"]["human_fix_resume"]["status"], "superseded")
+        state._ledger(changed)
+        clean = state.acknowledge_clean(original, feedback(rid=11, findings=False), now=NOW)
+        self.assertEqual(clean["pulls"]["pangin/example#7"]["human_fix_resume"]["status"], "superseded")
+        state._ledger(clean)
+
+    def test_superseding_question_archives_bound_resume_without_erasing_budgets(self):
+        original = self.previously_handled_answer()
+        fb = feedback(head=NEXT, rid=11, findings=False)
+        pending = self.posted(fb, original)
+        record = pending["pulls"]["pangin/example#7"]
+        self.assertNotIn("human_fix_resume", record)
+        self.assertEqual(record["human_request_history"][0]["fix_resume"],
+                         original["pulls"]["pangin/example#7"]["human_fix_resume"])
+        self.assertEqual(record["attempts"], 1)
+        self.assertEqual(record["processed_review_ids"], [10])
+        self.assertEqual(record["verification_attempts"], {HEAD: 1})
+        state._ledger(pending)
+
+    def test_missing_or_tampered_request_response_binding_fails_closed(self):
+        original = self.previously_handled_answer()
+        patches = [{"request_id": "human-" + "0" * 20}, {"head_sha": NEXT}, {"base_sha": NEXT},
+                   {"source_review_ids": [11]}, {"response_sha256": "0" * 64},
+                   {"answered_at": "2026-09-29T00:00:00Z"}, {"status": "consumed"}, {"extra": True}]
+        for patch in patches:
+            broken = deepcopy(original)
+            broken["pulls"]["pangin/example#7"]["human_fix_resume"].update(patch)
+            with self.subTest(patch=patch), self.assertRaises(state.StateError):
+                reserve(broken, feedback(rid=11))
+        no_proof = deepcopy(original)
+        del no_proof["pulls"]["pangin/example#7"]["human_fix_resume"]
+        with self.assertRaises(state.StateError):
+            reserve(no_proof, feedback(rid=11))
+
+    def test_legacy_answer_does_not_implicitly_grant_a_duplicate_head_exception(self):
+        answered = self.answer(self.posted())
+        answered["pulls"]["pangin/example#7"].update(processed_heads=[HEAD], processed_review_ids=[10])
+        self.assertNotIn("human_fix_resume", answered["pulls"]["pangin/example#7"])
+        with self.assertRaises(state.StateError):
+            reserve(answered, feedback(rid=11))
+
+    def test_explicit_baseline_refresh_archives_and_clears_execution_profile_without_a_fix_exception(self):
+        original = baseline(self.posted())
+        record = original["pulls"]["pangin/example#7"]
+        profile = {name: deepcopy(config()[name]) for name in ("test_image", "test_commands")}
+        record.update(review_execution_profile=profile, attempts=2, processed_heads=[HEAD],
+                      processed_review_ids=[10], verification_attempts={HEAD: 1})
+        question = record["human_request"]
+        response = human_input.parse_response(
+            f"/review-cycle update-docs {question['request_id']} {NEXT} docs/ADR.md approved criteria",
+            question, {"login": "pangin", "type": "User", "id": 1})
+        current = feedback(base=NEXT, rid=11, findings=False)
+        answered = state.record_user_response(original, current, response, now=NOW,
+                                              trusted_default_revision=NEXT)
+        refreshed = state.consume_baseline_refresh(answered["pulls"]["pangin/example#7"], current,
+                                                    trusted_revision=NEXT, now=NOW)
+        self.assertNotIn("review_execution_profile", refreshed)
+        self.assertEqual(refreshed["baseline_history"][0]["baseline"]["review_execution_profile"], profile)
+        self.assertNotIn("human_fix_resume", refreshed)
+        for name in ("attempts", "processed_heads", "processed_review_ids", "verification_attempts"):
+            self.assertEqual(refreshed[name], record[name])
+        with self.assertRaises(state.StateError):
+            reserve({"schema_version": 1, "pulls": {"pangin/example#7": refreshed}},
+                    feedback(base=NEXT, rid=11))
 
     def test_question_blocks_model_and_response_reopens_fresh_review(self):
         fb = feedback(findings=False)

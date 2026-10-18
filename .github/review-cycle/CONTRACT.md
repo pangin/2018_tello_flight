@@ -71,6 +71,14 @@ its verdicts and tests, and requires fresh independent reviews; it does not rese
 attempt history or grant new permissions. An ordinary default-branch movement
 never silently replaces the pinned baseline.
 
+The execution baseline also pins the official model, test image digest, test argv,
+required CI, mandatory document paths and criterion manifest. Even a valid new
+default-branch profile, or legacy evidence without that pin, requires explicit
+baseline approval; it is not silently adopted. A clarification can permit one
+same-head fix attempt only after a new canonical review submitted after that
+answer. It does not erase attempts, processed reviews or failure/stop locks.
+Document-baseline approval alone is not permission to retry a handled candidate.
+
 ## Marked final verdict and completion
 
 A controller request marked `<!-- review-cycle-request:v1 -->` supplies the exact

@@ -104,21 +104,45 @@ def validate_execution_profile(config, snapshot):
 
 
 def pin_manifest(config, snapshot, record, pr):
+    # A valid *current* profile is not authority to replace the one used for
+    # earlier findings, tests or review evidence. Pin all execution dependencies
+    # alongside the criterion manifest and compare them before any reservation.
+    config = validate_execution_profile(config, snapshot)
+    manifest = evidence.validate_manifest(config.get("review_criteria"), snapshot)
+    profile = {"schema_version": 1, "owner": config["owner"], "model": config["model"],
+               "test_image": config["test_image"], "test_commands": deepcopy(config["test_commands"]),
+               "required_ci": validate_ci_profile(config.get("required_ci")),
+               "review_documents": sorted(config["review_documents"]),
+               "criterion_manifest": deepcopy(manifest)}
     if "review_manifest" in record:
-        manifest = evidence.validate_manifest(record["review_manifest"]["criteria"], snapshot)
-        if manifest != record["review_manifest"]:
+        pinned = record["review_manifest"]
+        if not isinstance(pinned, dict):
+            raise state.StateError("Pinned criterion manifest is malformed")
+        if (evidence.validate_manifest(pinned.get("criteria"), snapshot) != pinned
+                or manifest != pinned):
             raise state.StateError("Pinned criterion manifest changed")
-        validate_ci_profile(record.get("review_required_ci"))
+        required_ci = validate_ci_profile(record.get("review_required_ci"))
         if record.get("review_criteria") != [item["id"] for item in manifest["criteria"]]:
             raise state.StateError("Pinned criterion IDs changed")
+        pinned_profile = record.get("review_execution_profile")
+        if not isinstance(pinned_profile, dict):
+            # Legacy evidence has no trustworthy image/argv baseline. Never
+            # migrate it implicitly from today's default-branch configuration.
+            raise state.StateError("Execution baseline is missing; approve a fresh baseline explicitly")
+        if (json.dumps(pinned_profile, sort_keys=True, separators=(",", ":"))
+                != json.dumps(profile, sort_keys=True, separators=(",", ":"))
+                or required_ci != profile["required_ci"]):
+            raise state.StateError("Pinned execution profile changed; approve a fresh baseline explicitly")
     else:
-        manifest = evidence.validate_manifest(config.get("review_criteria"), snapshot)
-        profile = validate_ci_profile(config.get("required_ci"))
+        if any(name in record for name in ("review_execution_profile", "review_criteria",
+                                           "review_required_ci", "review_task")):
+            raise state.StateError("Incomplete review baseline requires explicit approval")
         title, body = pr.get("title", ""), pr.get("body") or ""
         if not isinstance(title, str) or not isinstance(body, str) or len((title + body).encode()) > 8192:
             raise state.StateError("Complete author task context exceeds the 8 KiB limit")
         record.update(review_manifest=manifest, review_criteria=[item["id"] for item in manifest["criteria"]],
-                      review_required_ci=profile, review_task={"title": title, "body": body})
+                      review_required_ci=deepcopy(profile["required_ci"]),
+                      review_execution_profile=profile, review_task={"title": title, "body": body})
     return manifest
 
 
@@ -293,7 +317,7 @@ def verification_prompt(feedback, snapshot, manifest, task, human_guidance=None)
 def prepare(c, root, api, config, feedback, pr, reviews, identity, ledger, cid, snapshot):
     config = validate_execution_profile(config, snapshot)
     record = ledger["pulls"][f"{feedback['repository']}#{feedback['pr_number']}"]
-    manifest = record["review_manifest"]
+    manifest = pin_manifest(config, snapshot, record, pr)
     pair = feedback["head_sha"] + ":" + feedback["base_sha"]
     requests = record.setdefault("review_requests", {})
     request = requests.get(pair)
@@ -414,14 +438,60 @@ def complete(c, root, workspace, api):
     identity = state.validate_bot_identity(api.request("users/chatgpt-codex-connector%5Bbot%5D"))
     reviews = api.pages(f"repos/{repo}/pulls/{number}/reviews")
     comments = api.pages(f"repos/{repo}/pulls/{number}/comments")
-    current = state.collect_feedback(job["config"], api.request(f"repos/{repo}"),
-                                     c.live_pr(api, feedback), reviews, comments, identity)
-    if current is None or current["findings"]:
-        raise state.StateError("Native findings changed during final assessment")
-    native = evidence.parse_codex_review(reviews, current, identity, snapshot, manifest,
+    # A new explicit verdict is bound to this exact head/base and request. Parse
+    # the complete API review history before allowing it to supersede older
+    # same-head findings (which may have targeted an earlier base). Neither an
+    # absent/edited verdict nor an unmarked clean review can supply this cutoff.
+    native = evidence.parse_codex_review(reviews, feedback, identity, snapshot, manifest,
                                          requested_at=job["requested_at"])
     if native != job["codex_attestation"]:
         raise state.StateError("Native final attestation changed during assessment")
+    cutoff = state.timestamp(native["submitted_at"])
+    current_reviews, superseded_reviews = [], []
+    for review in reviews:
+        if (state._is_bot(review.get("user"), identity)
+                and review.get("commit_id") == feedback["head_sha"]
+                and review.get("state") in {"COMMENTED", "CHANGES_REQUESTED", "APPROVED"}):
+            # Do not interpret a malformed timestamp as an old/superseded review.
+            submitted = state.timestamp(review.get("submitted_at"))
+            if submitted >= cutoff:
+                current_reviews.append(review)
+            else:
+                superseded_reviews.append(review)
+    repository, current_pr = api.request(f"repos/{repo}"), c.live_pr(api, feedback)
+    current = state.collect_feedback(job["config"], repository, current_pr,
+                                     current_reviews, comments, identity)
+    if current is None or current["findings"]:
+        raise state.StateError("Native findings changed during final assessment")
+    # New or edited inline findings can be attached to an older submitted
+    # review. Inspect only those fresh comments, without reviving its superseded
+    # summary prose or historical inline findings. Protected paths still stop.
+    recent_comments = []
+    if not isinstance(comments, list):
+        raise state.StateError("Reviews and comments must be arrays")
+    for comment in comments:
+        if not isinstance(comment, dict):
+            raise state.StateError("Malformed review comment object")
+        body = comment.get("body")
+        if (state._is_bot(comment.get("user"), identity)
+                and comment.get("commit_id") == feedback["head_sha"]
+                and comment.get("original_commit_id", feedback["head_sha"]) == feedback["head_sha"]
+                and isinstance(body, str) and state.PRIORITY.search(body)):
+            created = state.timestamp(comment.get("created_at"))
+            updated = state.timestamp(comment.get("updated_at", comment.get("created_at")))
+            if updated < created:
+                raise state.StateError("Native inline finding timestamps are inconsistent")
+            if max(created, updated) >= cutoff:
+                recent_comments.append(comment)
+    if recent_comments and superseded_reviews:
+        inline = state.collect_feedback(job["config"], repository, current_pr,
+                                        superseded_reviews, recent_comments, identity)
+        # Keep API review objects untouched. Only findings whose IDs refer to
+        # the independently timestamp-checked comment subset are new activity;
+        # old review-summary findings in this result remain superseded.
+        comment_ids = {f"comment:{comment.get('id')}" for comment in recent_comments}
+        if inline is not None and any(item["id"] in comment_ids for item in inline["findings"]):
+            raise state.StateError("Native inline findings changed during final assessment")
     try:
         evidence.verify_evidence(workspace, native["verdict"], snapshot, manifest)
     except evidence.EvidenceError as exc:

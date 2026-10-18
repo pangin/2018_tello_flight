@@ -51,6 +51,7 @@ class AdapterTests(unittest.TestCase):
             "requested_at":REQUESTED,"status":"posted","comment_id":100}}
         self.codex = self.verdict("codex")
         self.reviews = [self.native_review(self.codex)]
+        self.review_comments = []
         self.check = {"id":101,"name":PROFILE[0]["name"],"head_sha":self.head,
                       "app":{"id":15368,"slug":"github-actions"}, "status":"completed","conclusion":"success",
                       "details_url":"https://github.com/pangin/example/actions/runs/42/job/101"}
@@ -99,7 +100,7 @@ class AdapterTests(unittest.TestCase):
 
     def pages(self, route):
         if route.endswith("/reviews"): return deepcopy(self.reviews)
-        if route.endswith("/pulls/7/comments"): return []
+        if route.endswith("/pulls/7/comments"): return deepcopy(self.review_comments)
         if route.endswith("/issues/7/comments"):
             return [{"id":99,"user":c.LEDGER_BOT,
                      "body":c.MARKER+"\n```json\n"+json.dumps(self.ledger)+"\n```"}]
@@ -223,6 +224,99 @@ class AdapterTests(unittest.TestCase):
         with self.assertRaises(s.StateError):self.complete()
         self.assertNotEqual(self.record["state"],"complete")
 
+    def old_finding_review(self):
+        return {"id": 10, "user": deepcopy(BOT), "commit_id": self.head, "state": "COMMENTED",
+                "submitted_at": "2026-10-01T00:04:00Z", "body": "[P1] Finding against an older base"}
+
+    def inline_finding(self, rid, *, created="2026-10-01T00:04:00Z", path="app.js", **changes):
+        return {"id": 201, "pull_request_review_id": rid, "user": deepcopy(BOT),
+                "commit_id": self.head, "original_commit_id": self.head, "line": 1,
+                "created_at": created, "path": path, "body": "[P1] Check behavior", **changes}
+
+    def test_fresh_bound_attestation_supersedes_older_same_head_findings(self):
+        self.reviews.insert(0, self.old_finding_review())
+        # Even a historical protected-path finding is superseded only by the
+        # independently parsed exact-pair marked attestation, never by silence.
+        self.review_comments = [self.inline_finding(10, path=".github/workflows/checks.yml")]
+        original_reviews, original_comments = deepcopy(self.reviews), deepcopy(self.review_comments)
+        self.prepare()
+        self.complete().assert_called_once()
+        self.assertEqual(self.record["state"], "complete")
+        self.assertEqual(self.reviews, original_reviews)
+        self.assertEqual(self.review_comments, original_comments)
+
+    def test_same_time_and_later_priority_reviews_still_block_final_consensus(self):
+        self.prepare()
+        for submitted in [NOW, "2026-10-01T00:05:01Z"]:
+            newer = {**self.old_finding_review(), "id": 21, "submitted_at": submitted}
+            self.reviews = [self.native_review(self.codex), newer]
+            with self.subTest(submitted=submitted), self.assertRaises(s.StateError):
+                self.complete()
+            self.assertNotEqual(self.record["state"], "complete")
+
+    def test_current_attestation_priority_prose_itself_still_blocks(self):
+        self.prepare()
+        # This edit does not change the parsed JSON attestation, so the
+        # independent fresh-finding scan must still detect its priority prose.
+        self.reviews[0]["body"] = "[P1] Still unresolved\n" + self.reviews[0]["body"]
+        with self.assertRaises(s.StateError):
+            self.complete()
+        self.assertNotEqual(self.record["state"], "complete")
+
+    def test_new_protected_inline_finding_blocks_even_on_superseded_review(self):
+        self.reviews.insert(0, self.old_finding_review())
+        self.prepare()
+        self.review_comments = [self.inline_finding(10, created=NOW, path=".github/workflows/checks.yml")]
+        with self.assertRaises(s.ProtectedFindingError):
+            self.complete()
+        self.assertNotEqual(self.record["state"], "complete")
+
+    def test_edited_old_inline_finding_blocks_without_reviving_old_summary(self):
+        self.reviews.insert(0, self.old_finding_review())
+        self.prepare()
+        self.review_comments = [self.inline_finding(10, updated_at=NOW)]
+        with self.assertRaisesRegex(s.StateError, "Native inline findings changed"):
+            self.complete()
+        self.assertNotEqual(self.record["state"], "complete")
+
+    def test_inline_update_strictly_before_attestation_remains_superseded(self):
+        self.reviews.insert(0, self.old_finding_review())
+        self.review_comments = [self.inline_finding(10, updated_at="2026-10-01T00:04:59Z")]
+        self.prepare()
+        self.complete().assert_called_once()
+        self.assertEqual(self.record["state"], "complete")
+
+    def test_invalid_inline_update_timestamp_does_not_become_historical(self):
+        self.reviews.insert(0, self.old_finding_review())
+        self.prepare()
+        for updated in ["invalid", "2026-10-01T00:03:59Z"]:
+            self.review_comments = [self.inline_finding(10, updated_at=updated)]
+            with self.subTest(updated=updated), self.assertRaises(s.StateError):
+                self.complete()
+            self.assertNotEqual(self.record["state"], "complete")
+
+    def test_missing_or_edited_attestation_cannot_supersede_old_findings(self):
+        self.reviews.insert(0, self.old_finding_review())
+        self.prepare()
+        original = deepcopy(self.reviews)
+        for change in ["removed", "changed"]:
+            self.reviews = deepcopy(original)
+            if change == "removed":
+                self.reviews.pop()
+            else:
+                self.reviews[-1]["body"] = self.reviews[-1]["body"].replace(
+                    "Document and current", "Changed assessment of")
+            with self.subTest(change=change), self.assertRaises(s.StateError):
+                self.complete()
+            self.assertNotEqual(self.record["state"], "complete")
+
+    def test_malformed_current_bot_review_timestamp_never_means_superseded(self):
+        self.prepare()
+        self.reviews.insert(0, {**self.old_finding_review(), "submitted_at": "invalid"})
+        with self.assertRaises((s.StateError, evidence.EvidenceError)):
+            self.complete()
+        self.assertNotEqual(self.record["state"], "complete")
+
     def test_failure_consumes_lease_and_prevents_implicit_second_assessment(self):
         self.prepare()
         c.record_finish(self.root,self.api,"failed","stopped")
@@ -239,8 +333,10 @@ class AdapterTests(unittest.TestCase):
 
     def test_manifest_and_ci_profile_are_immutable_across_config_changes(self):
         altered=deepcopy(self.config);altered["review_criteria"]=[];altered["required_ci"]=[]
-        result=cc.pin_manifest(altered,self.snapshot,self.record,self.pr)
-        self.assertEqual(result,self.manifest)
+        before=deepcopy(self.record)
+        with self.assertRaises((s.StateError, evidence.EvidenceError)):
+            cc.pin_manifest(altered,self.snapshot,self.record,self.pr)
+        self.assertEqual(self.record,before)
         self.assertEqual(self.record["review_required_ci"],PROFILE)
 
     def test_bad_ci_profiles_and_oversized_review_requests_fail_closed(self):

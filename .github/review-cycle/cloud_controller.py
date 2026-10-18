@@ -453,6 +453,9 @@ def prepare(root, event_path, config_path, api):
     if type(number) is not int or number <= 0:
         raise state.StateError("Missing PR number")
     pr = api.request(f"repos/{repo}/pulls/{number}")
+    if not resume_ci and not state.validate_review_event_pair(event.get("pull_request"), pr):
+        print("Submitted review concerns an older PR head/base pair; skipped.")
+        return
     if resume_ci and pr["head"]["sha"] != run["head_sha"]:
         print("CI completion concerns an older PR head; skipped.")
         return
@@ -463,9 +466,17 @@ def prepare(root, event_path, config_path, api):
         return
     reviews = api.pages(f"repos/{repo}/pulls/{number}/reviews")
     comments = api.pages(f"repos/{repo}/pulls/{number}/comments")
+    trigger = event.get("review") or {}
+    # REST reviews carry the head commit but not their original base. Only the
+    # submitted event's comparison pair was checked above; an older same-head
+    # review must not silently inherit that new base. Keep the full review list
+    # separately for explicit head/base-bound final-verdict assessment.
+    feedback_reviews = reviews if resume_ci else [
+        item for item in reviews if isinstance(item, dict) and item.get("id") == trigger.get("id")
+    ]
     protected_finding = False
     try:
-        feedback = state.collect_feedback(config, repository, pr, reviews, comments, identity)
+        feedback = state.collect_feedback(config, repository, pr, feedback_reviews, comments, identity)
     except state.ProtectedFindingError as exc:
         # Only this typed, fully scoped failure can become an owner question.
         # Arbitrary API/validation exceptions and untrusted comment text are not
@@ -475,7 +486,6 @@ def prepare(root, event_path, config_path, api):
     if feedback is None:
         print("No eligible current-head review.")
         return
-    trigger = event.get("review") or {}
     if not resume_ci and trigger.get("id") not in feedback["source_review_ids"]:
         print("Stale or ineligible triggering review; skipped.")
         return
@@ -565,9 +575,12 @@ def prepare(root, event_path, config_path, api):
         cloud_consensus.pin_manifest(config, snapshot, record, pr)
     except (state.StateError, review_documents.DocumentError, cloud_consensus.evidence.EvidenceError):
         request_human_input(root, api, feedback, ledger, cid,
-                            "The approved document/criterion baseline is missing, malformed or cannot "
-                            "be applied safely. Please inspect and approve the default-branch "
-                            "documents and finite criteria before automatic work can continue.",
+                            "The approved document/criterion or test execution baseline is missing, "
+                            "malformed or changed. Inspect the default-branch documents, finite "
+                            "criteria, digest-pinned test image, test argv and required CI policy. "
+                            "Use the request-bound update-docs command with the approved trusted "
+                            "default commit to adopt a fresh baseline explicitly; a clarification "
+                            "alone cannot replace missing or changed execution evidence.",
                             kind="criteria_conflict", sources=["trusted default-branch review document baseline"])
         return
     if record.get("human_response"):

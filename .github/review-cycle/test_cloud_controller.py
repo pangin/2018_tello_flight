@@ -44,7 +44,7 @@ class ControllerTests(unittest.TestCase):
         candidate["head"]["ref"] = "fix/example"
         candidate["base"]["ref"] = "main"
         c.save(self.root / "event.json", {"action": "submitted", "sender": BOT,
-                                        "pull_request": {"number": 7}, "review": {"id": 10}})
+                                        "pull_request": candidate, "review": {"id": 10}})
         def request(route, method="GET", payload=None):
             if route.startswith("users/"): return BOT
             if route == "repos/pangin/example": return repo()
@@ -140,6 +140,59 @@ class ControllerTests(unittest.TestCase):
         with patch.dict(os.environ, env, clear=True):
             c.prepare(self.root, self.root / "event.json", path, self.api)
         self.assertEqual(conversation, [])
+        self.assertFalse((self.root / "job.json").exists())
+
+    def test_review_event_old_base_or_head_never_reads_reviews_or_notifies(self):
+        for side in ("head", "base"):
+            with self.subTest(side=side):
+                path, env, conversation = self.protected_prepare_fixture()
+                event = c.load(self.root / "event.json")
+                event["pull_request"][side]["sha"] = "d" * 40
+                c.save(self.root / "event.json", event)
+                self.api.pages.reset_mock()
+                with patch.dict(os.environ, env, clear=True), patch.object(c, "test_container") as tests, \
+                     patch.object(c, "publish") as publish:
+                    c.prepare(self.root, self.root / "event.json", path, self.api)
+                self.api.pages.assert_not_called()
+                self.assertEqual(conversation, [])
+                self.assertFalse((self.root / "job.json").exists())
+                tests.assert_not_called()
+                publish.assert_not_called()
+
+    def test_review_event_missing_pair_fails_closed_before_review_or_notification(self):
+        path, env, conversation = self.protected_prepare_fixture()
+        event = c.load(self.root / "event.json")
+        event["pull_request"] = {"number": 7}
+        c.save(self.root / "event.json", event)
+        self.api.pages.reset_mock()
+        with patch.dict(os.environ, env, clear=True), self.assertRaises(s.StateError):
+            c.prepare(self.root, self.root / "event.json", path, self.api)
+        self.api.pages.assert_not_called()
+        self.assertEqual(conversation, [])
+        self.assertFalse((self.root / "job.json").exists())
+
+    def test_new_event_cannot_rebind_old_same_head_review_findings_to_its_base(self):
+        path, env, conversation = self.protected_prepare_fixture()
+        original_pages = self.api.pages.side_effect
+        old_review = review(head=self.head, rid=10)
+        current_review = review(head=self.head, rid=11, submitted="2026-09-30T03:00:01Z")
+        def pages(route):
+            if route.endswith("/reviews"):
+                return [old_review, current_review]
+            return original_pages(route)
+        self.api.pages.side_effect = pages
+        event = c.load(self.root / "event.json")
+        event["review"]["id"] = 11
+        c.save(self.root / "event.json", event)
+        with patch.dict(os.environ, env, clear=True), patch.object(c, "now", return_value=NOW), \
+             patch.object(consensus, "prepare") as final, patch.object(c, "output") as outputs:
+            c.prepare(self.root, self.root / "event.json", path, self.api)
+        final.assert_called_once()
+        self.assertEqual(final.call_args.args[4]["source_review_ids"], [11])
+        self.assertEqual(final.call_args.args[4]["findings"], [])
+        self.assertEqual(final.call_args.args[6], [old_review, current_review])
+        self.assertEqual(conversation, [])
+        self.assertNotIn(unittest.mock.call("run_claude", "true"), outputs.call_args_list)
         self.assertFalse((self.root / "job.json").exists())
 
     def test_noncanonical_event_never_notifies_for_protected_finding(self):

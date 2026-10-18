@@ -25,7 +25,8 @@ class ReviewDocumentTests(unittest.TestCase):
         self.revision = self.commit()
 
     def git(self, *args):
-        return subprocess.run(["git", "-c", "core.hooksPath=/dev/null", *args],
+        return subprocess.run(["git", "-c", "core.hooksPath=/dev/null",
+                               "-c", "maintenance.auto=false", "-c", "gc.auto=0", *args],
                               cwd=self.root, check=True, capture_output=True).stdout
 
     def write(self, name, content):
@@ -42,6 +43,14 @@ class ReviewDocumentTests(unittest.TestCase):
         return d.build_snapshot(self.root, revision or self.revision,
                                 ["README.md"] if documents is None else documents,
                                 ["src/feature/code.py"] if changed is None else changed)
+
+    def test_fixture_git_disables_detached_maintenance_before_cleanup(self):
+        actual = subprocess.run
+        with patch.object(subprocess, "run", wraps=actual) as run:
+            self.git("status", "--porcelain")
+        arguments = run.call_args.args[0]
+        self.assertIn("maintenance.auto=false", arguments)
+        self.assertIn("gc.auto=0", arguments)
 
     def test_includes_root_and_applicable_ancestor_instructions_only(self):
         snapshot = self.snapshot()

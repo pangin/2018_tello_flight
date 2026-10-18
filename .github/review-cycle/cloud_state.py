@@ -30,7 +30,7 @@ MAX_HUMAN_REQUEST_HISTORY = 10
 MAX_BASELINE_HISTORY = 10
 BASELINE_EVIDENCE_FIELDS = {
     "document_revision", "document_fingerprint", "document_paths", "review_manifest",
-    "review_criteria", "review_required_ci", "review_task", "review_requests",
+    "review_criteria", "review_required_ci", "review_execution_profile", "review_task", "review_requests",
     "native_final_verdict", "verified_codex_review", "consensus_proof",
     "reservation", "verification_reservation",
 }
@@ -96,6 +96,32 @@ def _sha(value) -> bool:
 
 def _login(value, expected=OWNER) -> bool:
     return isinstance(value, str) and value.casefold() == expected.casefold()
+
+
+def validate_review_event_pair(event_pr: dict, live_pr: dict) -> bool:
+    """Match the event's immutable comparison pair to the freshly fetched PR.
+
+    A same-head review is not evidence for a newer base. Malformed payloads fail
+    closed; well-formed stale or cross-repository pairs are simply ineligible.
+    Repository ownership, author, draft and fork policy remain separate gates.
+    """
+    pairs = []
+    for value in (event_pr, live_pr):
+        if not isinstance(value, dict) or not _integer(value.get("number")):
+            raise StateError("Review event requires a well-formed PR comparison pair")
+        sides = []
+        for name in ("head", "base"):
+            side = value.get(name)
+            repository = side.get("repo") if isinstance(side, dict) else None
+            full_name = repository.get("full_name") if isinstance(repository, dict) else None
+            if (not isinstance(side, dict) or not _sha(side.get("sha"))
+                    or not isinstance(full_name, str)
+                    or not re.fullmatch(r"[A-Za-z0-9-]+/[A-Za-z0-9_.-]+", full_name)):
+                raise StateError("Review event requires a well-formed PR comparison pair")
+            sides.append((side["sha"], full_name.casefold()))
+        pairs.append((value["number"], *sides))
+    return (pairs[0] == pairs[1]
+            and all(pair[1][1] == pair[2][1] for pair in pairs))
 
 
 def validate_config(config: dict) -> dict:
@@ -332,6 +358,53 @@ def validate_baseline_approval(value):
     return deepcopy(value)
 
 
+def _validate_human_fix_resume(value, request, response, answered_at, key):
+    """Validate one request-bound exception, never an erased dedupe history."""
+    fields = {"schema_version", "request_id", "head_sha", "base_sha", "source_review_ids",
+              "response_sha256", "answered_at", "status"}
+    status = value.get("status") if isinstance(value, dict) else None
+    if status == "consumed":
+        fields |= {"run_id", "resumed_review_ids", "consumed_at"}
+    elif status == "superseded":
+        fields |= {"superseded_at"}
+    if (not isinstance(value, dict) or set(value) != fields or value.get("schema_version") != 1
+            or status not in {"pending", "consumed", "superseded"}
+            or not isinstance(request, dict) or request.get("status") != "answered"
+            or not isinstance(response, dict) or response.get("option_id") != "clarify"
+            or f"{request.get('repository')}#{request.get('pr_number')}" != key
+            or value.get("request_id") != request.get("request_id")
+            or value.get("request_id") != response.get("request_id")
+            or value.get("response_sha256") != response.get("body_sha256")
+            or not isinstance(value.get("response_sha256"), str)
+            or not re.fullmatch(r"[0-9a-f]{64}", value["response_sha256"])
+            or value.get("answered_at") != answered_at
+            or any(not _sha(value.get(name)) or value[name] != request.get(name)
+                   for name in ("head_sha", "base_sha"))
+            or not isinstance(value.get("source_review_ids"), list)
+            or not value["source_review_ids"]
+            or value["source_review_ids"] != sorted(request.get("source_review_ids", []))):
+        raise StateError("Malformed request-bound fix resumption")
+    if timestamp(answered_at) < timestamp(request.get("created_at")):
+        raise StateError("Fix resumption predates the owner question")
+    if status == "consumed":
+        resumed = value["resumed_review_ids"]
+        if (not isinstance(value["run_id"], str) or not value["run_id"].strip()
+                or not isinstance(resumed, list) or not resumed
+                or any(not _integer(rid) for rid in resumed)
+                or resumed != sorted(set(resumed))
+                or set(resumed) & set(value["source_review_ids"])
+                or timestamp(value["consumed_at"]) < timestamp(answered_at)):
+            raise StateError("Malformed consumed fix resumption")
+    elif status == "superseded" and timestamp(value["superseded_at"]) < timestamp(answered_at):
+        raise StateError("Malformed superseded fix resumption")
+
+
+def _supersede_human_fix_resume(record, now):
+    resume = record.get("human_fix_resume")
+    if resume is not None and resume["status"] == "pending":
+        resume.update(status="superseded", superseded_at=now)
+
+
 def _ledger(value: dict) -> dict:
     if (not isinstance(value, dict) or value.get("schema_version") != 1
             or not isinstance(value.get("pulls"), dict)):
@@ -382,13 +455,15 @@ def _ledger(value: dict) -> dict:
             timestamp(answered_at)
             if response is None or question.get("status") != "answered":
                 raise StateError("Human answer time requires an answered question and response")
+        if "human_fix_resume" in record:
+            _validate_human_fix_resume(record["human_fix_resume"], question, response, answered_at, key)
         history = record.get("human_request_history", [])
         if not isinstance(history, list) or len(history) > MAX_HUMAN_REQUEST_HISTORY:
             raise StateError("Human question history exceeds its bounded audit limit")
         for entry in history:
             if (not isinstance(entry, dict)
                     or not {"request", "response"}.issubset(entry)
-                    or set(entry) - {"request", "response", "answered_at"}):
+                    or set(entry) - {"request", "response", "answered_at", "fix_resume"}):
                 raise StateError("Malformed human question history entry")
             try:
                 archived = human_input.validate_request(entry["request"])
@@ -402,6 +477,9 @@ def _ledger(value: dict) -> dict:
                 timestamp(entry["answered_at"])
                 if entry["response"] is None or archived["status"] != "answered":
                     raise StateError("Archived answer time requires an answered question and response")
+            if "fix_resume" in entry:
+                _validate_human_fix_resume(entry["fix_resume"], archived, entry["response"],
+                                           entry.get("answered_at"), key)
         if record["state"] == "needs_user_input" and (question is None or question.get("status") != "posted"):
             raise StateError("Human-input state requires a posted question")
         approval = record.get("baseline_refresh_approval")
@@ -438,8 +516,10 @@ def reserve(ledger: dict, feedback: dict, *, live_head_sha: str, live_base_sha: 
     """Reserve one attempt; caller atomically persists returned ledger under lock.
 
     Rejects stale head/base, seen reviews, a previously handled head, in-progress
-    work and failed/uncertain PRs. Null removes only the count cap, not those gates;
-    finite limits remain PR-wide and are never reset by a new head SHA.
+    work and failed/uncertain PRs. One owner clarification may authorize a single
+    same-head attempt using only new reviews; the controller must first verify
+    those canonical reviews were submitted after the answer. Null removes only
+    the count cap, not these gates; finite limits remain PR-wide.
     """
     feedback = _feedback(feedback, require_findings=True)
     result = _ledger(ledger)
@@ -458,9 +538,23 @@ def reserve(ledger: dict, feedback: dict, *, live_head_sha: str, live_base_sha: 
     if max_rounds is not None and record["attempts"] >= max_rounds:
         raise StateError("PR-wide automatic fix limit reached")
     new_reviews = set(feedback["source_review_ids"]) - set(record["processed_review_ids"])
+    resume = record.get("human_fix_resume")
+    owner_resume = (resume is not None and resume["status"] == "pending"
+                    and record["state"] == "ready"
+                    and not record.get("ci_failure")
+                    and resume["head_sha"] == feedback["head_sha"]
+                    and resume["base_sha"] == feedback["base_sha"]
+                    and not set(feedback["source_review_ids"]) & set(resume["source_review_ids"])
+                    and new_reviews == set(feedback["source_review_ids"])
+                    and timestamp(now) >= timestamp(resume["answered_at"]))
     if ((feedback["head_sha"] in record["processed_heads"]
-         and record["state"] != "awaiting_verification") or not new_reviews):
+         and record["state"] != "awaiting_verification" and not owner_resume) or not new_reviews):
         raise StateError("Review or current head has already been handled")
+    if owner_resume:
+        resume.update(status="consumed", consumed_at=now, run_id=run_id,
+                      resumed_review_ids=sorted(feedback["source_review_ids"]))
+    else:
+        _supersede_human_fix_resume(record, now)
     record.update({"state": "processing", "attempts": record["attempts"] + 1,
                    "reservation": {"run_id": run_id, "head_sha": feedback["head_sha"],
                                    "base_sha": feedback["base_sha"],
@@ -519,6 +613,7 @@ def acknowledge_clean(ledger: dict, feedback: dict, *, now: str) -> dict:
         raise StateError("PR requires attention before acknowledging a clean review")
     if record["state"] == "waiting_review" and record.get("pushed_head_sha") != feedback["head_sha"]:
         raise StateError("Clean review does not match the pushed commit")
+    _supersede_human_fix_resume(record, now)
     record.update({"state": "awaiting_verification", "updated_at": now,
                    "verified_codex_review": {
                        "head_sha": feedback["head_sha"], "base_sha": feedback["base_sha"],
@@ -553,8 +648,8 @@ def request_user_input(ledger: dict, feedback: dict, request: dict, *, now: str)
     record = result["pulls"].setdefault(_key(feedback), {
         "state": "ready", "attempts": 0, "processed_review_ids": [], "processed_heads": [],
     })
-    if record["state"] in {"processing", "verifying"}:
-        raise StateError("An active reservation cannot be replaced by a human question")
+    if record["state"] in {"processing", "verifying", "failed"}:
+        raise StateError("Active or failed work cannot be replaced by a human question")
     if record["state"] == "complete":
         raise StateError("Completed PR cannot be redirected to human input")
     if (record.get("human_response") or {}).get("option_id") == "stop":
@@ -576,6 +671,8 @@ def request_user_input(ledger: dict, feedback: dict, request: dict, *, now: str)
         archived = {"request": deepcopy(previous), "response": deepcopy(record.get("human_response"))}
         if record.get("human_answered_at") is not None:
             archived["answered_at"] = record["human_answered_at"]
+        if record.get("human_fix_resume") is not None:
+            archived["fix_resume"] = deepcopy(record["human_fix_resume"])
         history.append(archived)
     record.update({"state": "needs_user_input", "updated_at": now,
                    "human_request": request})
@@ -584,6 +681,7 @@ def request_user_input(ledger: dict, feedback: dict, request: dict, *, now: str)
         approval.update(status="superseded", superseded_at=now)
     record.pop("human_response", None)
     record.pop("human_answered_at", None)
+    record.pop("human_fix_resume", None)
     return result
 
 
@@ -625,6 +723,15 @@ def record_user_response(ledger: dict, feedback: dict, response: dict, *, now: s
     record.update({"state": "needs_review" if response["option_id"] == "stop" else "ready",
                    "updated_at": now, "human_request": request,
                    "human_response": response, "human_answered_at": now})
+    if (response["option_id"] == "clarify" and feedback["head_sha"] in record["processed_heads"]
+            and not record.get("ci_failure")):
+        record["human_fix_resume"] = {
+            "schema_version": 1, "request_id": request["request_id"],
+            "head_sha": request["head_sha"], "base_sha": request["base_sha"],
+            "source_review_ids": sorted(request["source_review_ids"]),
+            "response_sha256": response["body_sha256"], "answered_at": now, "status": "pending",
+        }
+        _validate_human_fix_resume(record["human_fix_resume"], request, response, now, _key(feedback))
     return result
 
 
